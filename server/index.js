@@ -34,7 +34,7 @@ app.get('/api/health', (req, res) => {
 	res.json({ status: 'ok' });
 });
 
-// AI Chat proxy route
+// AI Chat proxy route (n8n webhook variant)
 app.post('/api/chat', async (req, res) => {
 	try {
 		const { messages, sessionId } = req.body || {};
@@ -48,37 +48,78 @@ app.post('/api/chat', async (req, res) => {
 			await Message.create({ role: 'user', content: last.content, sessionId });
 		}
 
-		// Replace with your provider endpoint. Using OpenAI-style as example.
-		const AI_API_URL = process.env.AI_API_URL || 'https://api.openai.com/v1/chat/completions';
-		const AI_API_KEY = process.env.AI_API_KEY || '';
-		if (!AI_API_KEY) {
-			return res.status(500).json({ error: 'AI_API_KEY not set on server' });
-		}
-
-		const providerPayload = {
-			model: process.env.AI_MODEL || 'gpt-4o-mini',
+		// n8n webhook URL (no API key)
+		const AI_WEBHOOK_URL = process.env.AI_WEBHOOK_URL || 'https://learnerscorner.app.n8n.cloud/webhook-test/chatbot';
+		const webhookPayload = {
 			messages,
-			temperature: 0.2,
+			sessionId,
+			meta: { source: 'aura-chatbot', timestamp: Date.now() },
 		};
 
-		const aiResponse = await fetch(AI_API_URL, {
+		console.log('Sending to webhook:', AI_WEBHOOK_URL);
+		console.log('Payload:', JSON.stringify(webhookPayload, null, 2));
+
+		const aiResponse = await fetch(AI_WEBHOOK_URL, {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Authorization: `Bearer ${AI_API_KEY}`,
-			},
-			body: JSON.stringify(providerPayload),
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(webhookPayload),
 		});
+
+		console.log('Webhook response status:', aiResponse.status);
+		console.log('Webhook response headers:', Object.fromEntries(aiResponse.headers.entries()));
 
 		if (!aiResponse.ok) {
 			const text = await aiResponse.text();
-			return res.status(aiResponse.status).json({ error: 'AI provider error', details: text });
+			console.error('Webhook error response:', text);
+			
+			// Handle n8n test mode error
+			if (aiResponse.status === 404) {
+				try {
+					const errorData = JSON.parse(text);
+					if (errorData.message?.includes('webhook') && errorData.message?.includes('not registered')) {
+						// For testing, return a mock response instead of error
+						const mockResponse = `I'm Aura, your health assistant! I received your message: "${last?.content || 'Hello'}". 
+
+Note: The n8n webhook is not activated yet. Please click "Execute workflow" in your n8n canvas to enable real AI responses.`;
+						
+						await Message.create({ role: 'assistant', content: mockResponse, sessionId });
+						return res.json({ reply: mockResponse });
+					}
+				} catch (e) {
+					// Fall through to generic error
+				}
+			}
+			
+			return res.status(aiResponse.status).json({ error: 'AI webhook error', details: text });
 		}
 
-		const data = await aiResponse.json();
-		const assistantMessage = data?.choices?.[0]?.message?.content || 'Sorry, I could not generate a response.';
+		// Support flexible webhook outputs
+		let data;
+		const text = await aiResponse.text();
+		console.log('Webhook raw response:', text);
+		
+		try { 
+			data = JSON.parse(text); 
+			console.log('Parsed JSON response:', data);
+		} catch (e) { 
+			console.log('Non-JSON response, treating as string');
+			data = text; 
+		}
 
-		// Persist assistant reply (optional)
+		let assistantMessage = 'Sorry, I could not generate a response.';
+		if (typeof data === 'string') {
+			assistantMessage = data;
+		} else if (data?.output) {
+			// n8n webhook format
+			assistantMessage = data.output;
+		} else if (data?.reply) {
+			assistantMessage = data.reply;
+		} else if (data?.data?.reply) {
+			assistantMessage = data.data.reply;
+		} else if (Array.isArray(data?.choices) && data.choices[0]?.message?.content) {
+			assistantMessage = data.choices[0].message.content;
+		}
+
 		await Message.create({ role: 'assistant', content: assistantMessage, sessionId });
 
 		res.json({ reply: assistantMessage });
